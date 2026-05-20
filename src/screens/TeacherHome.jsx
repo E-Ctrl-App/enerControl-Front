@@ -1,43 +1,196 @@
-import React, {useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {
-  SafeAreaView,
-  View,
-  Text,
+  ActivityIndicator,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
-  Modal,
+  Text,
+  TextInput,
+  View,
 } from 'react-native';
+import {SafeAreaView} from 'react-native-safe-area-context';
 
-import InfoRow from '../components/InfoRow';
-import ClassItem from '../components/ClassItem';
-import HistoryItem from '../components/HistoryItem';
 import TabButton from '../components/TabButton';
+import {getDashboard} from '../api/dashboard';
+import {toggleDevice} from '../api/devices';
+import {scanQr} from '../api/qr';
+import {getSocket} from '../api/socket';
 
-export default function TeacherHome({onLogout}) {
+const deviceTypeLabels = {
+  FAN: 'Ventilador',
+  LIGHT: 'Luz',
+  PROJECTOR: 'Proyector',
+};
+
+const statusLabels = {
+  ACTIVE: 'Activo',
+  INACTIVE: 'Inactivo',
+  OFF: 'Apagado',
+  ON: 'Encendido',
+};
+
+function getInitials(name = '') {
+  return name
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(part => part[0])
+    .join('')
+    .toUpperCase();
+}
+
+function formatNumber(value, suffix = '') {
+  if (value === undefined || value === null) {
+    return `0${suffix}`;
+  }
+
+  return `${Number(value).toLocaleString('es-MX', {
+    maximumFractionDigits: 2,
+  })}${suffix}`;
+}
+
+export default function TeacherHome({session, onLogout}) {
+  const {user} = session;
   const [tab, setTab] = useState('inicio');
-  const [lightsOn, setLightsOn] = useState(false);
-  const [modalVisible, setModalVisible] = useState(false);
-  const [selectedRoom, setSelectedRoom] = useState(null);
+  const [qrCode, setQrCode] = useState('ROOM_A201');
+  const [classroom, setClassroom] = useState(null);
+  const [devices, setDevices] = useState([]);
+  const [dashboard, setDashboard] = useState(null);
+  const [loadingDashboard, setLoadingDashboard] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [togglingId, setTogglingId] = useState(null);
+  const [error, setError] = useState('');
+  const [socketEvents, setSocketEvents] = useState([]);
 
-  const rooms = [
-    {id: 'A-101', name: 'Lab. Cómputo', cap: 28, status: 'ocupado'},
-    {id: 'A-102', name: 'Aula Magna', cap: 40, status: 'libre'},
-    {id: 'B-201', name: 'Lab. de Física', cap: 24, status: 'libre'},
-    {id: 'B-202', name: 'Aula asignada', cap: 35, status: 'ocupado'},
-    {id: 'C-301', name: 'Multimedia', cap: 30, status: 'libre'},
-  ];
+  const roleLabel = user.role === 'TEACHER' ? 'Docente' : 'Alumno';
+  const allowedHint =
+    user.role === 'TEACHER'
+      ? 'Puedes controlar luces, proyectores y ventiladores habilitados.'
+      : 'Tu rol puede controlar solo luces habilitadas.';
+
+  const loadDashboard = useCallback(async () => {
+    setLoadingDashboard(true);
+    setError('');
+
+    try {
+      const nextDashboard = await getDashboard();
+      setDashboard(nextDashboard);
+    } catch (nextError) {
+      setError(nextError.message);
+    } finally {
+      setLoadingDashboard(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadDashboard();
+  }, [loadDashboard]);
+
+  useEffect(() => {
+    const socket = getSocket();
+
+    function handleDeviceUpdated(payload) {
+      setSocketEvents(events => [
+        `Dispositivo actualizado: ${payload.name || payload.deviceId}`,
+        ...events,
+      ].slice(0, 4));
+      setDevices(currentDevices =>
+        currentDevices.map(device =>
+          device.id === payload.deviceId || device.id === payload.id
+            ? {...device, ...payload, id: device.id, status: payload.status}
+            : device,
+        ),
+      );
+      loadDashboard();
+    }
+
+    function handleQrScanned(payload) {
+      setSocketEvents(events => [
+        `QR escaneado: ${payload.classroomName || payload.classroomId}`,
+        ...events,
+      ].slice(0, 4));
+      loadDashboard();
+    }
+
+    socket.on('device.updated', handleDeviceUpdated);
+    socket.on('qr.scanned', handleQrScanned);
+
+    return () => {
+      socket.off('device.updated', handleDeviceUpdated);
+      socket.off('qr.scanned', handleQrScanned);
+    };
+  }, [loadDashboard]);
+
+  const dashboardSummary = dashboard?.summary;
+  const classrooms = dashboard?.classrooms || [];
+  const dashboardDevices = dashboard?.devices || [];
+  const activity = dashboard?.activity;
+
+  const deviceCounts = useMemo(() => {
+    const on = devices.filter(device => device.status === 'ON').length;
+    return {on, total: devices.length};
+  }, [devices]);
+
+  async function handleScanQr() {
+    if (!qrCode.trim()) {
+      setError('Ingresa el texto del QR, por ejemplo ROOM_A201.');
+      return;
+    }
+
+    setScanning(true);
+    setError('');
+
+    try {
+      const result = await scanQr(qrCode.trim());
+      setClassroom(result.classroom);
+      setDevices(result.devices || []);
+      setTab('dispositivos');
+      await loadDashboard();
+    } catch (nextError) {
+      setError(nextError.message);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function handleToggleDevice(device) {
+    if (!device.allowed) {
+      return;
+    }
+
+    setTogglingId(device.id);
+    setError('');
+
+    try {
+      const updatedDevice = await toggleDevice(device.id);
+      setDevices(currentDevices =>
+        currentDevices.map(currentDevice =>
+          currentDevice.id === device.id
+            ? {...currentDevice, ...updatedDevice, allowed: currentDevice.allowed}
+            : currentDevice,
+        ),
+      );
+      await loadDashboard();
+    } catch (nextError) {
+      setError(nextError.message);
+    } finally {
+      setTogglingId(null);
+    }
+  }
 
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.appbar}>
         <View style={styles.avatar}>
-          <Text style={styles.avatarText}>MG</Text>
+          <Text style={styles.avatarText}>{getInitials(user.name)}</Text>
         </View>
 
-        <View style={{flex: 1}}>
-          <Text style={styles.appbarName}>Mtra. García López</Text>
-          <Text style={styles.appbarRole}>Ing. Industrial · ID 4821</Text>
+        <View style={styles.appbarContent}>
+          <Text style={styles.appbarName}>{user.name}</Text>
+          <Text style={styles.appbarRole}>
+            {roleLabel} · {user.email}
+          </Text>
         </View>
 
         <Pressable onPress={onLogout}>
@@ -45,279 +198,472 @@ export default function TeacherHome({onLogout}) {
         </Pressable>
       </View>
 
-      <ScrollView style={styles.scroll} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        refreshControl={
+          <RefreshControl refreshing={loadingDashboard} onRefresh={loadDashboard} />
+        }
+        style={styles.scroll}
+        showsVerticalScrollIndicator={false}>
+        {!!error && <Text style={styles.errorText}>{error}</Text>}
+
         {tab === 'inicio' && (
           <>
-            <Text style={styles.sectionLabel}>Mi salón asignado hoy</Text>
-
-            <View style={styles.scheduleCard}>
-              <Text style={styles.eyebrow}>Próxima clase</Text>
-              <Text style={styles.roomTitle}>B-202</Text>
-              <Text style={styles.subject}>Cálculo Diferencial · Grupo 3A</Text>
-              <Text style={styles.meta}>08:00 – 10:00 · Edificio B, piso 2</Text>
-              <Text style={styles.meta}>35 alumnos</Text>
+            <Text style={styles.sectionLabel}>Sesión</Text>
+            <View style={styles.heroPanel}>
+              <Text style={styles.eyebrow}>EcoCampus</Text>
+              <Text style={styles.heroTitle}>Hola, {user.name}</Text>
+              <Text style={styles.heroSub}>{allowedHint}</Text>
             </View>
 
-            <Text style={styles.sectionLabel}>Control de iluminación — B-202</Text>
-
-            <View style={[styles.lightPill, lightsOn && styles.lightPillOn]}>
-              <Text style={[styles.lightText, lightsOn && styles.lightTextOn]}>
-                {lightsOn ? 'Luces encendidas · B-202' : 'Luces apagadas'}
-              </Text>
+            <Text style={styles.sectionLabel}>Escanear QR</Text>
+            <View style={styles.panel}>
+              <Text style={styles.panelTitle}>Código del salón</Text>
+              <TextInput
+                autoCapitalize="characters"
+                onChangeText={setQrCode}
+                placeholder="ROOM_A201"
+                placeholderTextColor="#64748b"
+                style={styles.input}
+                value={qrCode}
+              />
+              <Pressable
+                disabled={scanning}
+                style={[styles.primaryButton, scanning && styles.buttonDisabled]}
+                onPress={handleScanQr}>
+                {scanning ? (
+                  <ActivityIndicator color="#ffffff" />
+                ) : (
+                  <Text style={styles.primaryButtonText}>Consultar salón</Text>
+                )}
+              </Pressable>
             </View>
 
-            <Pressable
-              style={[styles.lightButton, lightsOn && styles.lightButtonOff]}
-              onPress={() => setLightsOn(!lightsOn)}>
-              <Text style={styles.lightButtonText}>
-                {lightsOn ? 'Apagar luces del salón' : 'Encender luces del salón'}
-              </Text>
-            </Pressable>
-
-            <Text style={styles.sectionLabel}>Sesión en curso</Text>
-
-            <View style={styles.sessionCard}>
-              <Text style={styles.timer}>00:00:00</Text>
-              <Text style={styles.timerSub}>Tiempo de sesión activa</Text>
-
-              <InfoRow label="Entrada" value={lightsOn ? '08:00' : '—'} />
-              <InfoRow label="Consumo" value={lightsOn ? '0.248 kWh' : '0.000 kWh'} />
-              <InfoRow label="Salón" value="B-202" />
+            <Text style={styles.sectionLabel}>Resumen</Text>
+            <View style={styles.statsGrid}>
+              <MetricCard
+                label="Aulas activas"
+                value={formatNumber(dashboardSummary?.activeClassrooms)}
+              />
+              <MetricCard
+                label="Dispositivos ON"
+                value={`${formatNumber(dashboardSummary?.devicesOn)} / ${formatNumber(
+                  dashboardSummary?.totalDevices,
+                )}`}
+              />
+              <MetricCard
+                label="Sesiones"
+                value={formatNumber(dashboardSummary?.activeSessions)}
+              />
+              <MetricCard
+                label="Consumo"
+                value={formatNumber(dashboardSummary?.estimatedConsumption, ' kWh')}
+              />
             </View>
 
-            <Text style={styles.sectionLabel}>Mis clases del día</Text>
-            <ClassItem title="Cálculo Diferencial" meta="08:00 – 10:00 · Grupo 3A" />
-            <ClassItem title="Álgebra Lineal" meta="12:00 – 14:00 · Grupo 2B" />
-            <ClassItem title="Cálculo Integral" meta="16:00 – 18:00 · Grupo 4A" />
+            {!!socketEvents.length && (
+              <>
+                <Text style={styles.sectionLabel}>Tiempo real</Text>
+                {socketEvents.map((event, index) => (
+                  <Text key={`${event}-${index}`} style={styles.eventLine}>
+                    {event}
+                  </Text>
+                ))}
+              </>
+            )}
           </>
         )}
 
-        {tab === 'salones' && (
+        {tab === 'dispositivos' && (
           <>
-            <Text style={styles.pageTitle}>Disponibilidad de salones</Text>
-            <Text style={styles.pageSub}>Toca un salón libre para solicitarlo</Text>
+            <Text style={styles.pageTitle}>
+              {classroom ? classroom.name : 'Sin salón escaneado'}
+            </Text>
+            <Text style={styles.pageSub}>
+              {classroom
+                ? `${deviceCounts.on} de ${deviceCounts.total} dispositivos encendidos`
+                : 'Escanea un QR para cargar dispositivos.'}
+            </Text>
 
-            {rooms.map(room => (
+            {!classroom && (
               <Pressable
-                key={room.id}
-                style={styles.roomCard}
-                disabled={room.status !== 'libre'}
-                onPress={() => {
-                  setSelectedRoom(room);
-                  setModalVisible(true);
-                }}>
-                <View>
-                  <Text style={styles.roomCode}>{room.id}</Text>
-                  <Text style={styles.roomName}>{room.name}</Text>
-                  <Text style={styles.roomCap}>Capacidad: {room.cap} personas</Text>
-                </View>
-
-                <Text
-                  style={[
-                    styles.statusChip,
-                    room.status === 'libre' ? styles.freeChip : styles.busyChip,
-                  ]}>
-                  {room.status === 'libre' ? 'Libre' : 'Ocupado'}
-                </Text>
+                style={styles.primaryButton}
+                onPress={() => setTab('inicio')}>
+                <Text style={styles.primaryButtonText}>Ir a escanear</Text>
               </Pressable>
+            )}
+
+            {devices.map(device => (
+              <DeviceCard
+                key={device.id}
+                device={device}
+                loading={togglingId === device.id}
+                onToggle={() => handleToggleDevice(device)}
+              />
             ))}
           </>
         )}
 
-        {tab === 'historial' && (
+        {tab === 'dashboard' && (
           <>
-            <Text style={styles.pageTitle}>Mi consumo energético</Text>
-
-            <View style={styles.statsRow}>
-              <View style={styles.bigStatCard}>
-                <Text style={styles.statLabel}>Total esta semana</Text>
-                <Text style={styles.bigStatValue}>18.4 kWh</Text>
+            <View style={styles.dashboardHeader}>
+              <View>
+                <Text style={styles.pageTitle}>Dashboard</Text>
+                <Text style={styles.pageSub}>Métricas del campus en vivo</Text>
               </View>
-
-              <View style={styles.bigStatCard}>
-                <Text style={styles.statLabel}>Ahorro logrado</Text>
-                <Text style={styles.bigStatValue}>↓ 14%</Text>
-              </View>
+              {loadingDashboard && <ActivityIndicator color="#34d399" />}
             </View>
 
-            <Text style={styles.sectionLabel}>Sesiones de esta semana</Text>
+            <View style={styles.statsGrid}>
+              <MetricCard
+                label="Aulas activas"
+                value={formatNumber(dashboardSummary?.activeClassrooms)}
+              />
+              <MetricCard
+                label="Ahorro"
+                value={formatNumber(dashboardSummary?.estimatedSavings, ' kWh')}
+              />
+              <MetricCard
+                label="Encendidos"
+                value={formatNumber(dashboardSummary?.devicesOn)}
+              />
+              <MetricCard
+                label="Total"
+                value={formatNumber(dashboardSummary?.totalDevices)}
+              />
+            </View>
 
-            <HistoryItem title="Cálculo Diferencial" meta="Lun · 08:00 – 09:48" value="0.53 kWh" />
-            <HistoryItem title="Lab. Cómputo" meta="Mar · 10:00 – 11:55" value="1.02 kWh" />
-            <HistoryItem title="Multimedia" meta="Jue · 12:00 – 13:50" value="0.67 kWh" />
+            <Text style={styles.sectionLabel}>Salones</Text>
+            {classrooms.map(item => (
+              <View key={item.id} style={styles.listCard}>
+                <View>
+                  <Text style={styles.cardTitle}>{item.name}</Text>
+                  <Text style={styles.cardMeta}>
+                    {item.devicesOn} de {item.totalDevices} encendidos
+                  </Text>
+                </View>
+                <Text
+                  style={[
+                    styles.statusChip,
+                    item.status === 'ACTIVE' ? styles.onChip : styles.offChip,
+                  ]}>
+                  {statusLabels[item.status] || item.status}
+                </Text>
+              </View>
+            ))}
+
+            <Text style={styles.sectionLabel}>Dispositivos por salón</Text>
+            {dashboardDevices.map(group => (
+              <View key={group.classroom.id} style={styles.groupCard}>
+                <Text style={styles.cardTitle}>{group.classroom.name}</Text>
+                <Text style={styles.cardMeta}>{group.classroom.qrCode}</Text>
+                {(group.devices || []).map(device => (
+                  <View key={device.id} style={styles.inlineRow}>
+                    <Text style={styles.inlineText}>{device.name}</Text>
+                    <Text
+                      style={[
+                        styles.inlineStatus,
+                        device.status === 'ON' && styles.inlineStatusOn,
+                      ]}>
+                      {statusLabels[device.status] || device.status}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ))}
+
+            <Text style={styles.sectionLabel}>Actividad reciente</Text>
+            {(activity?.latestQrSessions || []).map(item => (
+              <View key={`qr-${item.id}`} style={styles.activityCard}>
+                <Text style={styles.cardTitle}>
+                  {item.user?.name} escaneó {item.classroom?.name}
+                </Text>
+                <Text style={styles.cardMeta}>
+                  {new Date(item.entryTime).toLocaleString('es-MX')}
+                </Text>
+              </View>
+            ))}
+            {(activity?.latestDevicesModified || []).map(item => (
+              <View key={`device-${item.id}`} style={styles.activityCard}>
+                <Text style={styles.cardTitle}>
+                  {item.name} quedó {statusLabels[item.status] || item.status}
+                </Text>
+                <Text style={styles.cardMeta}>
+                  {item.classroom?.name} · {deviceTypeLabels[item.type] || item.type}
+                </Text>
+              </View>
+            ))}
           </>
         )}
       </ScrollView>
 
       <View style={styles.bottomNav}>
         <TabButton label="Inicio" active={tab === 'inicio'} onPress={() => setTab('inicio')} />
-        <TabButton label="Salones" active={tab === 'salones'} onPress={() => setTab('salones')} />
-        <TabButton label="Historial" active={tab === 'historial'} onPress={() => setTab('historial')} />
+        <TabButton
+          label="Dispositivos"
+          active={tab === 'dispositivos'}
+          onPress={() => setTab('dispositivos')}
+        />
+        <TabButton
+          label="Dashboard"
+          active={tab === 'dashboard'}
+          onPress={() => setTab('dashboard')}
+        />
       </View>
-
-      <Modal transparent visible={modalVisible} animationType="fade">
-        <View style={styles.modalBg}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Solicitar salón</Text>
-            <Text style={styles.modalSub}>¿Deseas reservar este salón?</Text>
-
-            <Text style={styles.modalRoom}>{selectedRoom?.id}</Text>
-            <Text style={styles.modalRoomName}>{selectedRoom?.name}</Text>
-
-            <View style={styles.modalButtons}>
-              <Pressable style={styles.cancelButton} onPress={() => setModalVisible(false)}>
-                <Text style={styles.cancelText}>Cancelar</Text>
-              </Pressable>
-
-              <Pressable style={styles.confirmButton} onPress={() => setModalVisible(false)}>
-                <Text style={styles.confirmText}>Confirmar reserva</Text>
-              </Pressable>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </SafeAreaView>
   );
 }
 
+function MetricCard({label, value}) {
+  return (
+    <View style={styles.metricCard}>
+      <Text style={styles.metricValue}>{value}</Text>
+      <Text style={styles.metricLabel}>{label}</Text>
+    </View>
+  );
+}
+
+function DeviceCard({device, loading, onToggle}) {
+  const isOn = device.status === 'ON';
+
+  return (
+    <View style={[styles.deviceCard, !device.allowed && styles.deviceLocked]}>
+      <View style={styles.deviceHeader}>
+        <View>
+          <Text style={styles.cardTitle}>{device.name}</Text>
+          <Text style={styles.cardMeta}>
+            {deviceTypeLabels[device.type] || device.type}
+          </Text>
+        </View>
+        <Text style={[styles.statusChip, isOn ? styles.onChip : styles.offChip]}>
+          {statusLabels[device.status] || device.status}
+        </Text>
+      </View>
+
+      {device.allowed ? (
+        <Pressable
+          disabled={loading}
+          style={[
+            styles.toggleButton,
+            isOn ? styles.toggleButtonOff : styles.toggleButtonOn,
+            loading && styles.buttonDisabled,
+          ]}
+          onPress={onToggle}>
+          {loading ? (
+            <ActivityIndicator color="#ffffff" />
+          ) : (
+            <Text style={styles.toggleButtonText}>
+              {isOn ? 'Apagar' : 'Encender'}
+            </Text>
+          )}
+        </Pressable>
+      ) : (
+        <Text style={styles.lockedText}>Bloqueado para tu rol</Text>
+      )}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  container: {flex: 1, backgroundColor: '#07111f'},
+  container: {backgroundColor: '#07111f', flex: 1},
   appbar: {
-    flexDirection: 'row',
     alignItems: 'center',
-    padding: 18,
-    borderBottomWidth: 1,
     borderBottomColor: '#1e293b',
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    padding: 18,
   },
   avatar: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    backgroundColor: '#22c55e',
-    justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: '#22c55e',
+    borderRadius: 23,
+    height: 46,
+    justifyContent: 'center',
     marginRight: 12,
+    width: 46,
   },
-  avatarText: {fontWeight: '900', color: '#052e16'},
-  appbarName: {color: '#ffffff', fontWeight: '900', fontSize: 16},
+  avatarText: {color: '#052e16', fontWeight: '900'},
+  appbarContent: {flex: 1},
+  appbarName: {color: '#ffffff', fontSize: 16, fontWeight: '900'},
   appbarRole: {color: '#94a3b8', marginTop: 2},
   logoutText: {color: '#f87171', fontWeight: '800'},
   scroll: {flex: 1, padding: 18},
   sectionLabel: {
     color: '#94a3b8',
+    fontSize: 12,
     fontWeight: '800',
     marginBottom: 10,
     marginTop: 10,
     textTransform: 'uppercase',
-    fontSize: 12,
   },
-  scheduleCard: {
+  heroPanel: {
     backgroundColor: '#102a43',
-    padding: 20,
-    borderRadius: 24,
-    marginBottom: 14,
-    borderWidth: 1,
     borderColor: '#1e3a5f',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginBottom: 14,
+    padding: 20,
   },
   eyebrow: {color: '#93c5fd', fontWeight: '800', marginBottom: 8},
-  roomTitle: {color: '#ffffff', fontSize: 42, fontWeight: '900'},
-  subject: {color: '#e2e8f0', fontSize: 16, fontWeight: '700', marginTop: 4},
-  meta: {color: '#94a3b8', marginTop: 6},
-  lightPill: {
-    backgroundColor: '#1e293b',
-    borderRadius: 99,
-    padding: 12,
-    marginBottom: 12,
-  },
-  lightPillOn: {backgroundColor: '#064e3b'},
-  lightText: {color: '#cbd5e1', fontWeight: '800', textAlign: 'center'},
-  lightTextOn: {color: '#bbf7d0'},
-  lightButton: {
-    backgroundColor: '#22c55e',
-    padding: 16,
-    borderRadius: 18,
-    alignItems: 'center',
-    marginBottom: 18,
-  },
-  lightButtonOff: {backgroundColor: '#ef4444'},
-  lightButtonText: {color: '#ffffff', fontWeight: '900', fontSize: 16},
-  sessionCard: {
+  heroTitle: {color: '#ffffff', fontSize: 30, fontWeight: '900'},
+  heroSub: {color: '#cbd5e1', lineHeight: 22, marginTop: 8},
+  panel: {
     backgroundColor: '#0f172a',
-    padding: 18,
-    borderRadius: 22,
-    borderWidth: 1,
     borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
     marginBottom: 16,
-  },
-  timer: {
-    color: '#ffffff',
-    fontSize: 34,
-    fontWeight: '900',
-    textAlign: 'center',
-  },
-  timerSub: {color: '#94a3b8', textAlign: 'center', marginBottom: 16},
-  pageTitle: {color: '#ffffff', fontSize: 24, fontWeight: '900', marginTop: 10},
-  pageSub: {color: '#94a3b8', marginTop: 4, marginBottom: 18},
-  roomCard: {
-    backgroundColor: '#0f172a',
     padding: 16,
-    borderRadius: 18,
+  },
+  panelTitle: {color: '#ffffff', fontSize: 17, fontWeight: '900', marginBottom: 10},
+  input: {
+    backgroundColor: '#f8fafc',
+    borderRadius: 8,
+    color: '#0f172a',
+    fontWeight: '800',
     marginBottom: 12,
-    borderWidth: 1,
+    padding: 14,
+  },
+  primaryButton: {
+    alignItems: 'center',
+    backgroundColor: '#16a34a',
+    borderRadius: 8,
+    justifyContent: 'center',
+    minHeight: 50,
+    padding: 15,
+  },
+  primaryButtonText: {color: '#ffffff', fontSize: 16, fontWeight: '900'},
+  buttonDisabled: {opacity: 0.72},
+  errorText: {
+    backgroundColor: '#3f1d1d',
+    borderRadius: 8,
+    color: '#fecaca',
+    fontWeight: '800',
+    lineHeight: 20,
+    marginBottom: 12,
+    padding: 12,
+  },
+  statsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 12,
+  },
+  metricCard: {
+    backgroundColor: '#0f172a',
     borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
+    minHeight: 88,
+    padding: 14,
+    width: '48%',
+  },
+  metricValue: {color: '#ffffff', fontSize: 21, fontWeight: '900'},
+  metricLabel: {color: '#94a3b8', fontSize: 12, marginTop: 6},
+  eventLine: {
+    backgroundColor: '#0f172a',
+    borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#bbf7d0',
+    fontWeight: '800',
+    marginBottom: 8,
+    padding: 12,
+  },
+  pageTitle: {color: '#ffffff', fontSize: 24, fontWeight: '900', marginTop: 10},
+  pageSub: {color: '#94a3b8', marginBottom: 18, marginTop: 4},
+  deviceCard: {
+    backgroundColor: '#0f172a',
+    borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginBottom: 12,
+    padding: 16,
+  },
+  deviceLocked: {opacity: 0.72},
+  deviceHeader: {
+    alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    marginBottom: 14,
   },
-  roomCode: {color: '#ffffff', fontWeight: '900', fontSize: 18},
-  roomName: {color: '#e2e8f0', fontWeight: '700', marginTop: 4},
-  roomCap: {color: '#94a3b8', marginTop: 3},
+  cardTitle: {color: '#ffffff', fontSize: 16, fontWeight: '900'},
+  cardMeta: {color: '#94a3b8', marginTop: 4},
   statusChip: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
     borderRadius: 999,
     fontWeight: '900',
     overflow: 'hidden',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
   },
-  freeChip: {backgroundColor: '#064e3b', color: '#bbf7d0'},
-  busyChip: {backgroundColor: '#3f1d1d', color: '#fecaca'},
-  statsRow: {flexDirection: 'row', gap: 10, marginTop: 18},
-  statLabel: {color: '#94a3b8', fontSize: 12, marginTop: 4},
-  bigStatCard: {
-    flex: 1,
+  onChip: {backgroundColor: '#064e3b', color: '#bbf7d0'},
+  offChip: {backgroundColor: '#263244', color: '#cbd5e1'},
+  toggleButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    minHeight: 46,
+    justifyContent: 'center',
+    padding: 13,
+  },
+  toggleButtonOn: {backgroundColor: '#16a34a'},
+  toggleButtonOff: {backgroundColor: '#dc2626'},
+  toggleButtonText: {color: '#ffffff', fontWeight: '900'},
+  lockedText: {
+    backgroundColor: '#263244',
+    borderRadius: 8,
+    color: '#cbd5e1',
+    fontWeight: '800',
+    padding: 12,
+    textAlign: 'center',
+  },
+  dashboardHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  listCard: {
+    alignItems: 'center',
     backgroundColor: '#0f172a',
-    borderRadius: 20,
-    padding: 16,
-    borderWidth: 1,
     borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    padding: 16,
   },
-  bigStatValue: {color: '#ffffff', fontSize: 21, fontWeight: '900', marginTop: 8},
+  groupCard: {
+    backgroundColor: '#0f172a',
+    borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginBottom: 10,
+    padding: 16,
+  },
+  inlineRow: {
+    alignItems: 'center',
+    borderTopColor: '#1e293b',
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    paddingTop: 10,
+  },
+  inlineText: {color: '#e2e8f0', fontWeight: '700'},
+  inlineStatus: {color: '#cbd5e1', fontWeight: '900'},
+  inlineStatusOn: {color: '#86efac'},
+  activityCard: {
+    backgroundColor: '#0f172a',
+    borderColor: '#1e293b',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginBottom: 10,
+    padding: 16,
+  },
   bottomNav: {
+    backgroundColor: '#07111f',
+    borderTopColor: '#1e293b',
+    borderTopWidth: 1,
     flexDirection: 'row',
     padding: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#1e293b',
-    backgroundColor: '#07111f',
   },
-  modalBg: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.65)',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  modalCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 24,
-    padding: 22,
-    alignItems: 'center',
-  },
-  modalTitle: {color: '#0f172a', fontWeight: '900', fontSize: 22},
-  modalSub: {color: '#64748b', marginTop: 6},
-  modalRoom: {color: '#16a34a', fontSize: 42, fontWeight: '900', marginTop: 18},
-  modalRoomName: {color: '#334155', fontWeight: '800', marginBottom: 22},
-  modalButtons: {flexDirection: 'row', gap: 10},
-  cancelButton: {padding: 14, borderRadius: 14, backgroundColor: '#e2e8f0'},
-  confirmButton: {padding: 14, borderRadius: 14, backgroundColor: '#16a34a'},
-  cancelText: {color: '#334155', fontWeight: '800'},
-  confirmText: {color: '#ffffff', fontWeight: '900'},
 });
